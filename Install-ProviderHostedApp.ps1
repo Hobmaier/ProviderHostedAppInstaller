@@ -1,4 +1,24 @@
-﻿param
+﻿<#
+.Synopsis
+    Use this script to install a SharePoint Hosted App
+.Description
+    It will install a SharePoint Provider Hosted App which was build using Visual Studio, the folder structure could look like this:
+        Solutions2Share.MeetingManager.Solutions2Share.MeetingManager.app
+        Solutions2Share.Solutions.MeetingManagerWeb.deploy-readme.txt
+        Solutions2Share.Solutions.MeetingManagerWeb.deploy.cmd
+        Solutions2Share.Solutions.MeetingManagerWeb.SetParameters.xml
+        Solutions2Share.Solutions.MeetingManagerWeb.SourceManifest.xml
+        Solutions2Share.Solutions.MeetingManagerWeb.zip
+        Install-ProviderHostedApp-Config.xml
+        Install-ProviderHostedApp.ps1
+        ProviderHostedApp.pfx
+        WebDeploy_2_10_amd64_en-US.msi
+.Example
+    .\Install-ProviderHostedApp.ps1 -InputFile "D:\ProviderHostedAppInstaller\Install-ProviderHostedApp-Config.xml"
+.Parameter InputFile
+    Defines the XML Configuration file which includes environment specific details such as SQL, Service Account. Please use the example provided with this script.
+#>
+param
 (
     [string]$InputFile = $(throw '- Need parameter input file (e.g. "C:\Install\MeetingManager.xml")')
 )
@@ -41,6 +61,7 @@ foreach ($Database in $Setup.ProviderHostedApp.Database.Databasename)
 Write-Host "`nDone" -ForegroundColor Green
 Write-Host 'Import IIS Module'
 Import-Module WebAdministration -ErrorAction Stop
+Write-Verbose 'Load AssemblyName System.IO.Compression.FileSystem'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 # SQL
@@ -117,12 +138,10 @@ Function Add-SQLAlias()
 # ====================================================================================
 Function CheckSQLAccess
 {
-    WriteLine
     # Look for references to DB Servers, Aliases, etc. in the XML
     ForEach ($node in $Setup.SelectNodes("//*[DBServer]"))
     {
         $dbServer = (GetFromNode $node "DBServer")
-        If ($node.DatabaseServer) {$dbServer = GetFromNode $node "DatabaseServer"}
         # If the DBServer has been specified, and we've asked to set up an alias, create one
         If (!([string]::IsNullOrEmpty($dbServer)) -and ($node.DBAlias.Create -eq $true))
         {
@@ -146,12 +165,6 @@ Function CheckSQLAccess
 
     $currentUser = "$env:USERDOMAIN\$env:USERNAME"
     $serverRolesToCheck = "dbcreator","securityadmin"
-    # If we are provisioning PerformancePoint but aren't running SharePoint 2010 Service Pack 1 yet, we need sysadmin in order to run the RenameDatabase function
-    # We also evidently need sysadmin in order to configure MaxDOP on the SQL instance if we are installing SharePoint 2013
-    If (($Setup.Configuration.EnterpriseServiceApps.PerformancePointService) -and (ShouldIProvision $Setup.Configuration.EnterpriseServiceApps.PerformancePointService -eq $true) -and (!(CheckFor2010SP1)))
-    {
-        $serverRolesToCheck += "sysadmin"
-    }
 
     ForEach ($sqlServer in ($dbServers | Select-Object -Unique))
     {
@@ -161,8 +174,8 @@ Function CheckSQLAccess
             $objSQLCommand = New-Object System.Data.SqlClient.SqlCommand
             Try
             {
-                $objSQLConnection.ConnectionString = "Server=$sqlServer;Integrated Security=SSPI;"
-                Write-Host -ForegroundColor White " - Testing access to SQL server/instance/alias:" $sqlServer
+                $objSQLConnection.ConnectionString = "Server=$sqlServer,$($SQLPort);Integrated Security=SSPI;"
+                Write-Host -ForegroundColor White " - Testing access to SQL server/instance/alias:Port $($sqlServer):$($SQLPort)"
                 Write-Host -ForegroundColor White " - Trying to connect to `"$sqlServer`"..." -NoNewline
                 $objSQLConnection.Open() | Out-Null
                 Write-Host -ForegroundColor Black -BackgroundColor Green "Success"
@@ -220,8 +233,7 @@ Function CheckSQLAccess
                 If ($errText.Contains("network-related"))
                 {
                     Write-Warning "Connection Error. Check server name, port, firewall."
-                    Write-Host -ForegroundColor White " - This may be expected if e.g. SQL server isn't installed yet, and you are just installing SharePoint binaries for now."
-                    Pause "continue without checking SQL Server connection, or Ctrl-C to exit" "y"
+                    Throw "SQL Connectivity Error"
                 }
                 ElseIf ($errText.Contains("Login failed"))
                 {
@@ -242,7 +254,6 @@ Function CheckSQLAccess
             }
         }
     }
-    WriteLine
 }
 
 #Create Database
@@ -406,7 +417,86 @@ Function ValidateCredentials($Credentials)
 }
 #endregion
 
+function UploadSPFile
+{
+    param (
+        $SiteUrl,
+        $LibraryName,
+        $SourceFile
+    )
+
+    #Load SharePoint CSOM Assemblies
+    [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SharePoint.Client") | Out-Null
+    [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SharePoint.Client.Runtime") | Out-Null
+     
+    #Setup Credentials to connect
+    $Credentials = [System.Net.CredentialCache]::DefaultCredentials  #Current User Credentials
+    #connect using user account/password
+    #$Credentials = New-Object System.Net.NetworkCredential($UserName, (ConvertTo-SecureString $Password -AsPlainText -Force))
+    #For Office 365, Use:
+    #$Credentials = New-Object Microsoft.SharePoint.Client.SharePointOnlineCredentials($UserName,(ConvertTo-SecureString $Password -AsPlainText -Force))
+     
+    #Set up the context
+    $Context = New-Object Microsoft.SharePoint.Client.ClientContext($SiteUrl) 
+    $Context.Credentials = $credentials
+    $web = $Context.Web
+     
+    #Get the Library
+    $List = $web.Lists.GetByTitle($LibraryName)
+    $Context.Load($List)
+    $Context.ExecuteQuery()
+         
+    #Get File Name from source file path
+    $SourceFileName = Split-path $SourceFile -leaf
+     
+    #Get Source file contents
+    $FileStream = ([System.IO.FileInfo] (Get-Item $SourceFile)).OpenRead()
+     
+    #Upload to SharePoint
+    $FileCreationInfo = New-Object Microsoft.SharePoint.Client.FileCreationInformation
+    $FileCreationInfo.Overwrite = $true
+    $FileCreationInfo.ContentStream = $FileStream
+    $FileCreationInfo.URL = $SourceFileName
+    $FileUploaded = $List.RootFolder.Files.Add($FileCreationInfo)
+    $Context.Load($FileUploaded)
+    $Context.ExecuteQuery()
+     
+    #Set Metadata
+    $properties = $FileUploaded.ListItemAllFields;
+    $context.Load($properties)
+    #$properties["Category"]="Reports"
+    $properties.Update() 
+    $context.ExecuteQuery()
+      
+    #Close file stream
+    $FileStream.Close()
+}
+
+Function GetFromNode([System.Xml.XmlElement]$node, [string] $item)
+{
+    $value = $node.GetAttribute($item)
+    If ($value -eq "")
+    {
+        $child = $node.SelectSingleNode($item);
+        If ($child -ne $null)
+        {
+            Return $child.InnerText;
+        }
+    }
+    Return $value;
+}
+
 # FUNCTIONS END
+
+Write-Output 'Check SQL connectivity and permissions'
+CheckSQLAccess
+
+# Get Credentials for use later (IIS App Pool, Database) and check if user / pwd is correct
+while ($cred -eq $null) {
+    Write-Host 'Please provide credentials for Application Pool Account'
+    $cred = Get-Credential -UserName $Serviceaccount -Message 'Application Pool Account'
+    ValidateCredentials $cred
+}
 
 #Create Database(s) and assign the owner to service account
 #According to DatabaseTypes
@@ -449,11 +539,6 @@ try {
 }
 catch {
     $AppPool = New-WebAppPool -Name 'Meeting Manager Pool' -force -ErrorAction stop
-    while ($cred -eq $null) {
-        Write-Host 'Please provide credentials for Application Pool Account'
-        $cred = Get-Credential -UserName $Serviceaccount -Message 'Application Pool Account'
-        ValidateCredentials $cred
-    }
     $appPool.processModel.userName = $cred.UserName
     $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($cred.Password)
     $PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR) 
@@ -503,10 +588,10 @@ catch {
 
 #AppRegNew
 Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction Stop
-$spweb = Get-SPWeb -identity $spweb
-$realm = Get-SPAuthenticationRealm -ServiceContext $spweb.Site;
+$SPAppWebweb = Get-SPWeb -identity $spweb
+$realm = Get-SPAuthenticationRealm -ServiceContext $SPAppWebweb.Site;
 $appIdentifier = $clientID  + '@' + $realm;
-Register-SPAppPrincipal -DisplayName $appName -NameIdentifier $appIdentifier -Site $spweb -ErrorAction Stop
+Register-SPAppPrincipal -DisplayName $appName -NameIdentifier $appIdentifier -Site $SPAppWebweb -ErrorAction Stop
 
 #Server-to-Server (S2S) Trust
 #If creating the Certificate just through New-SelfSignedCertificate directly, it won't work. Therefore I've created
@@ -514,7 +599,9 @@ Register-SPAppPrincipal -DisplayName $appName -NameIdentifier $appIdentifier -Si
 $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2((Join-Path -Path $PSScriptRoot -ChildPath 'ProviderHostedApp.pfx'),"Solutions2Share")
 $SelfSignedCert = New-SelfSignedCertificate -CloneCert $certificate -DnsName MeetingManager -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop
 #Export to prepare S2S Trust
-Export-Certificate -Cert Cert:\LocalMachine\my\$($SelfSignedCert.Thumbprint) -FilePath (Join-Path -Path $PhysicalBasePath -ChildPath 'Installer.cer') | Out-Null
+# Wait, sometimes it's not ready immediately
+Start-Sleep -Seconds 2
+Export-Certificate -Cert Cert:\LocalMachine\my\$($SelfSignedCert.Thumbprint) -FilePath (Join-Path -Path $PhysicalBasePath -ChildPath 'Installer.cer') -ErrorAction Stop | Out-Null
 
 #Import into Root CA as well
 #Duplicate! as used in New-AppHighTrust as well.
@@ -648,9 +735,12 @@ If ($Solutions2Share)
 {
     Write-Host 'Change Application.config' -NoNewline
     try {
+        Write-Verbose 'Create Backup of applicationHost.config'
+        Copy-Item -Path "$($env:SystemRoot)\system32\inetsrv\config\applicationHost.config" -Destination "$PhysicalBasePath\applicationHost.config"
         [xml]$IISAppConfig = (Get-Content "$($env:SystemRoot)\system32\inetsrv\config\applicationHost.config" -ErrorAction Inquire)
+        <#
         $i = 0
-        <# Looks like these attributes are already set.
+        Looks like these attributes are already set.
         foreach ($Site in $IISAppConfig.configuration.'system.applicationHost'.sites.site)
         {
             If ($Site.Name -eq $appName)
@@ -667,42 +757,96 @@ If ($Solutions2Share)
             $i++
         }
         #>
-
+        $ServiceProviderFound = $false
+        foreach ($ServiceProvider in $IISAppConfig.configuration.'system.applicationHost'.serviceAutoStartProviders.add)
+        {
+            #Check if already exist, otherwise create it
+            If ($ServiceProvider.type -eq 'Solutions2Share.Solutions.MeetingManagerInvitationsWeb.ApplicationPreload,Solutions2Share.Solutions.MeetingManagerInvitationsWeb')
+            {
+                $ServiceProviderFound = $true
+            }
+        }
         #After closing <weblimits />    
-        [xml]$ServiceProvider = '<serviceAutoStartProviders>
-                    <add name="ApplicationPreload" type="Solutions2Share.Solutions.MeetingManagerInvitationsWeb.ApplicationPreload,Solutions2Share.Solutions.MeetingManagerInvitationsWeb" />
-        </serviceAutoStartProviders>'
-        $ModifiedXML = $IISAppConfig.configuration.'system.applicationHost'.InnerXml
-        $ModifiedXML = $ModifiedXML + $ServiceProvider.InnerXml
-        $IISAppConfig.configuration.'system.applicationHost'.InnerXml = $ModifiedXML
+        If (!$ServiceProviderFound)
+        {
+            [xml]$ServiceProvider = '<serviceAutoStartProviders>
+                        <add name="ApplicationPreload" type="Solutions2Share.Solutions.MeetingManagerInvitationsWeb.ApplicationPreload,Solutions2Share.Solutions.MeetingManagerInvitationsWeb" />
+            </serviceAutoStartProviders>'
+            $ModifiedXML = $IISAppConfig.configuration.'system.applicationHost'.InnerXml
+            $ModifiedXML = $ModifiedXML + $ServiceProvider.InnerXml
+            $IISAppConfig.configuration.'system.applicationHost'.InnerXml = $ModifiedXML
 
-        $IISAppConfig.Save("$($env:SystemRoot)\system32\inetsrv\config\applicationHost.config")
-        Write-Host 'Done' -ForegroundColor Green
+            $IISAppConfig.Save("$($env:SystemRoot)\system32\inetsrv\config\applicationHost.config")
+            Write-Host 'Done' -ForegroundColor Green
+        } else {
+            Write-Verbose 'Do not modify applicationHost.config - serviceAutoStartProviders found'
+        }
     }
     catch {
         throw $error[0].ToString()
     }
 }
 
-#IIS Authentication
+If ($Solutions2Share)
+{
+    #This section may need customization based on the properties of your App Files.
+    #TODO IIS Authentication
+    # system.webServer/security/authentication/anonymousAuthentication
+    # Set-WebConfigurationProperty -Filter "/system.webServer/security/authentication/windowsAuthentication" -Name Enabled -Value True -PSPath "IIS:\Sites\$SiteName\$AppName"
+    Write-Host 'Adjust .app Manifest'
 
-Write-Host 'Adjust .app Manifest'
+    Write-Verbose 'Rename .app to .zip'
+    Rename-Item -Path (Get-ChildItem "$PSScriptRoot\*.app") -NewName "$appName.zip"
+    Write-Verbose 'Unzip'
+    Unzip (Get-ChildItem "$PSScriptRoot\$appName.zip") "$PhysicalBasePath\App"
 
-Rename-Item (Get-ChildItem "$PSScriptRoot\*.app") -NewName "$appName.zip"
-Unzip (Get-ChildItem "$PSScriptRoot\$appName.zip") "$PhysicalBasePath\App"
 
+    [xml]$AppManifest = Get-Content "$PhysicalBasePath\App\AppManifest.xml" -ErrorAction Inquire
 
-[xml]$AppManifest = Get-Content "$PhysicalBasePath\App\AppManifest.xml" -ErrorAction Inquire
-[xml]$AppElements = Get-Content "$PhysicalBasePath\App\Elements*.xml" -ErrorAction Inquire
+    foreach ($ElementsXML in (Get-ChildItem "C:\Install\MM\Solutions2Share.MeetingManager\Elements*.xml"))
+    {
+        #Should be one, otherwise it gets overwritten by the last
+        [xml]$AppElements = Get-Content $ElementsXML.FullName -ErrorAction Inquire
+    }
 
-$AppManifest.App.Properties.StartPage = "https://$FQDN/?{StandardTokens}&amp;TypeDisplay=FullScreen&amp;SPHostLogoUrl=Content/img/S2SLogo.png"
-$AppManifest.App.AppPrincipal.RemoteWebApplication.ClientId = $clientID
-$AppManifest.Save("$PhysicalBasePath\App\AppManifest.xml")
+    $AppManifest.App.Properties.StartPage = "https://$FQDN/?{StandardTokens}&amp;TypeDisplay=FullScreen&amp;SPHostLogoUrl=Content/img/S2SLogo.png"
+    $AppManifest.App.AppPrincipal.RemoteWebApplication.ClientId = $clientID.ToString()
+    $AppManifest.Save("$PhysicalBasePath\App\AppManifest.xml")
 
-$AppElements.Elements.ClientWebPart.Content.Src = "https://$FQDN/MeetingManagerAppPart?{StandardTokens}"
-$AppElements.Save("$PhysicalBasePath\App\Elements*.xml")
+    $AppElements.Elements.ClientWebPart.Content.Src = "https://$FQDN/MeetingManagerAppPart?{StandardTokens}"
+    #Now save it under its original name determined by Get-Content before
+    $AppElements.Save($ElementsXML.FullName)
 
-Zip "$PhysicalBasePath\App" "$PhysicalBasePath\$AppFilename.zip"
-Rename-Item ("$PhysicalBasePath\$AppFilename.zip") -NewName "$appName.app"
+    Write-Verbose 'Create ZIP'
+    #BUG ZIP function is not good and App Catalog cannot extract it
+    Zip "$PhysicalBasePath\App" "$PhysicalBasePath\$AppFilename.zip"
+    Write-Verbose 'Rename .ZIP to .app'
+    Rename-Item -Path ("$PhysicalBasePath\$AppFilename.zip") -NewName "$appName.app"
 
-#Upload .app File to App Catalog
+    Write-Output 'Determine App Catalog'
+    Write-Verbose "SPWeb:($($SPWeb.split('/')[0])//$($SPWeb.split('/')[2])"
+    #WebAppURL get it from Web by splitting / and then use protocol // webapp
+    $SPAppCatalog = Get-AppCatalog -WebAppUrl (($SPWeb.split('/')[0]) + '//' + ($SPWeb.split('/')[2]))
+    If ($SPAppCatalog)
+    {
+        Write-Output 'App Catalog URL ' $SPAppCatalog
+        #Upload .app File to App Catalog
+        Write-Output 'Upload App File to App Catalog'
+        try {
+            UploadSPFile -SiteUrl $SPAppCatalog -LibraryName 'Apps for SharePoint' -SourceFile ("$PhysicalBasePath\$appName.app")
+        }
+        catch {
+            Write-Output 'Upload failed, please upload manually'
+            Write-Output "Source File: $PhysicalBasePath\$appName.app" 
+            Write-Output "To App Catalog: $SPAppCatalog"
+            throw $error[0].ToString()
+            break
+        }
+    } else {
+        Write-Output 'No App Catalog found, please create one an upload .app file manually'
+    }
+} else {
+    Write-Output 'Please adjust .app File manually and upload it to App Catalog'
+}
+
+Write-Output 'Done, please run "iisreset /noforce" on each SharePoint Server or wait 24 hours'
