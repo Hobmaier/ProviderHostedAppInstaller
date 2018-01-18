@@ -18,6 +18,7 @@
 .Parameter InputFile
     Defines the XML Configuration file which includes environment specific details such as SQL, Service Account. Please use the example provided with this script.
 #>
+[cmdletbinding()]
 param
 (
     [string]$InputFile = $(throw '- Need parameter input file (e.g. "C:\Install\MeetingManager.xml")')
@@ -365,12 +366,7 @@ function Unzip
 
     [System.IO.Compression.ZipFile]::ExtractToDirectory($zipfile, $outpath)
 }
-function Zip
-{
-    param([string]$sourcefile,[string]$zipfile)
 
-    [System.IO.Compression.ZipFile]::CreateFromDirectory($sourcefile, $zipfile)
-}
 function Get-AppCatalog
 {
     param(
@@ -486,6 +482,92 @@ Function GetFromNode([System.Xml.XmlElement]$node, [string] $item)
     Return $value;
 }
 
+#by @alexeymiasoedov http://purple-screen.com/?p=440
+#Works with .app files but only when adding to existing ZIP file
+function New-ZipFile {
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory,ValueFromPipeline)]
+        [string[]] $InputObject,
+        [Parameter(Mandatory)]
+        [string] $ZipFilePath,
+        [ValidateSet('Optimal','Fastest','NoCompression')]
+        [System.IO.Compression.CompressionLevel] $Compression = 'Optimal',
+        [switch] $Append,
+        [switch] $Force
+    )
+    Begin {
+        if (-not (Split-Path $ZipFilePath)) { $ZipFilePath = Join-Path $Pwd $ZipFilePath }
+        if (Test-Path $ZipFilePath) {
+            if ($Append.IsPresent) {
+                Write-Verbose 'Appending to the destination file'
+                $Archive = [System.IO.Compression.ZipFile]::Open($ZipFilePath,'Update')
+            } elseif ($Force.IsPresent) {
+                Write-Verbose 'Removing the destination file'
+                Remove-Item $ZipFilePath
+                $Archive = [System.IO.Compression.ZipFile]::Open($ZipFilePath,'Create')
+            } else {
+                Write-Error 'Output file already exists. Specify -Force option to replace it or -Append to add/replace files in existing archive'
+                break
+            }
+        } else {
+            $Archive = [System.IO.Compression.ZipFile]::Open($ZipFilePath,'Create')
+        }
+    }
+    Process {
+        foreach ($Obj in $InputObject) {
+            try {
+                switch ((Get-Item $Obj -ea Stop).GetType().Name) {
+                    FileInfo {
+                        $EntryName = Split-Path $Obj -Leaf
+                        $Entry = $Archive.Entries | ? FullName -eq $EntryName
+                        if ($Entry) {
+                            if ($Force.IsPresent) {
+                                Write-Verbose "Removing $EntryName from the archive"
+                                $Entry.Delete()
+                            } else {
+                                throw "File $EntryName already exists in the archive"
+                            }
+                        }
+                        $Verbose = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Archive,$Obj,$EntryName,$Compression)
+                        Write-Verbose $Verbose
+                    }
+                    DirectoryInfo {
+                        Push-Location $Obj
+                        (Get-ChildItem . -Recurse -File).FullName | % {
+                            $EntryName = (Join-Path (Split-Path $Obj -Leaf) (Resolve-Path $_ -Relative).TrimStart('.\')) -replace '\\','/'
+                            $Entry = $Archive.Entries | ? FullName -eq $EntryName 
+                            if ($Entry) {
+                                if ($Force.IsPresent) {
+                                    Write-Verbose "Removing $EntryName from the archive"
+                                    $Entry.Delete()
+                                } else {
+                                    throw "File $EntryName already exists in the archive"
+                                }
+                            }
+                            $Verbose = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Archive,$_,$EntryName,$Compression)
+                            Write-Verbose $Verbose
+                        }
+                        Pop-Location
+                    }
+                }
+            } catch {
+                Write-Error $_
+                $Archive.Dispose()
+                Pop-Location
+                if ($_.CategoryInfo.TargetType -ne [string] -and -not $Append.IsPresent) {
+                    Remove-Item $ZipFilePath
+                }
+                return
+            }
+        }
+    }
+    End {
+        $Archive.Dispose()
+        Get-Item $ZipFilePath
+    }
+}
+
 # FUNCTIONS END
 
 Write-Output 'Check SQL connectivity and permissions'
@@ -589,23 +671,22 @@ catch {
 #AppRegNew
 Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction Stop
 $SPAppWebweb = Get-SPWeb -identity $spweb
-$realm = Get-SPAuthenticationRealm -ServiceContext $SPAppWebweb.Site;
-$appIdentifier = $clientID  + '@' + $realm;
-Register-SPAppPrincipal -DisplayName $appName -NameIdentifier $appIdentifier -Site $SPAppWebweb -ErrorAction Stop
+$realm = Get-SPAuthenticationRealm -ServiceContext $SPAppWebweb.Site.Url
+$appIdentifier = $clientID  + '@' + $realm
+Write-Verbose "SPAppWebweb $SPAppWebweb"
+Write-Verbose "appIdentifier $appIdentifier"
+Set-Content -path $PhysicalBasePath\appIdentifier.txt -Value $appIdentifier
+Register-SPAppPrincipal -DisplayName $appName -NameIdentifier $appIdentifier -Site $SPAppWebweb.Site.Url -ErrorAction Stop
 
 #Server-to-Server (S2S) Trust
 #If creating the Certificate just through New-SelfSignedCertificate directly, it won't work. Therefore I've created
 #a Self-Signed Certificate in IIS Manager UI, exported it and clone it now, hope it works.
 $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2((Join-Path -Path $PSScriptRoot -ChildPath 'ProviderHostedApp.pfx'),"Solutions2Share")
-$SelfSignedCert = New-SelfSignedCertificate -CloneCert $certificate -DnsName MeetingManager -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop
+$SelfSignedCert = New-SelfSignedCertificate -CloneCert $certificate -DnsName $appInternalName -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop
 #Export to prepare S2S Trust
 # Wait, sometimes it's not ready immediately
 Start-Sleep -Seconds 2
 Export-Certificate -Cert Cert:\LocalMachine\my\$($SelfSignedCert.Thumbprint) -FilePath (Join-Path -Path $PhysicalBasePath -ChildPath 'Installer.cer') -ErrorAction Stop | Out-Null
-
-#Import into Root CA as well
-#Duplicate! as used in New-AppHighTrust as well.
-#New-SPTrustedRootAuthority -Name $appInternalName -Certificate (Join-Path -Path $PhysicalBasePath -ChildPath 'Installer.cer') -ErrorAction Stop
 
 Write-Host 'Create Server to Server Trust'
 try {
@@ -643,14 +724,18 @@ try {
                             $attribute.Value = $clientID.ToString()
                         }
                         'MeetingManagerAppFrameworkConnectionString' {
-                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($SQLPrefix + $DBs.MM);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
+                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($DBPrefix + $DBs.MM);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
                         }
                         'MeetingManagerHangfireConnectionString' {
-                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($SQLPrefix + $DBs.MMHF);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
+                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($DBPrefix + $DBs.MMHF);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
                         }     
                         'MeetingManagerClientSigningCertificateSerialNumber' {
                             $CertificateSerialNumber = $SelfSignedCert.SerialNumber
                             $attribute.Value = $CertificateSerialNumber.ToString()
+                        }
+                        'OutlookAddInUrl'
+                        {
+                            $attribute.Value = "https://$($Website.Name + '/' + $WebAppMM.name)/Outlook"
                         }
                         Default {
                             Write-Host 'No mapping for ' $attribute.Name -ForegroundColor Yellow
@@ -670,10 +755,10 @@ try {
                             $attribute.Value = $($Website.name + '/' + $WebAppIM.name)
                         }
                         'InvitationToolDefaultConnectionString' {
-                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($SQLPrefix + $DBs.IM);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
+                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($DBPrefix + $DBs.IM);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
                         }
                         'InvitationToolHangfireConnectionString' {
-                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($SQLPrefix + $DBs.IMHF);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
+                            $attribute.Value = $("Data Source=$($SQLServer),$($SQLPort);Initial Catalog=$($DBPrefix + $DBs.IMHF);Persist Security Info=True;Trusted_Connection=True;Pooling=False")
                         }  
                         'InvitationToolSPUsername' {
                             
@@ -794,34 +879,39 @@ If ($Solutions2Share)
     # system.webServer/security/authentication/anonymousAuthentication
     # Set-WebConfigurationProperty -Filter "/system.webServer/security/authentication/windowsAuthentication" -Name Enabled -Value True -PSPath "IIS:\Sites\$SiteName\$AppName"
     Write-Host 'Adjust .app Manifest'
-
+    Write-Verbose 'Copy .app'
+    Copy-Item (Get-ChildItem "$PSScriptRoot\*.app") -Destination $PhysicalBasePath
     Write-Verbose 'Rename .app to .zip'
-    Rename-Item -Path (Get-ChildItem "$PSScriptRoot\*.app") -NewName "$appName.zip"
+    Rename-Item -Path (Get-ChildItem "$PhysicalBasePath\*.app") -NewName "$appName.zip"
     Write-Verbose 'Unzip'
-    Unzip (Get-ChildItem "$PSScriptRoot\$appName.zip") "$PhysicalBasePath\App"
+    Unzip (Get-ChildItem "$PhysicalBasePath\$appName.zip") "$PhysicalBasePath\App"
 
 
     [xml]$AppManifest = Get-Content "$PhysicalBasePath\App\AppManifest.xml" -ErrorAction Inquire
 
-    foreach ($ElementsXML in (Get-ChildItem "C:\Install\MM\Solutions2Share.MeetingManager\Elements*.xml"))
+    foreach ($ElementsXML in (Get-ChildItem "$PhysicalBasePath\App\Elements*.xml"))
     {
         #Should be one, otherwise it gets overwritten by the last
         [xml]$AppElements = Get-Content $ElementsXML.FullName -ErrorAction Inquire
     }
 
-    $AppManifest.App.Properties.StartPage = "https://$FQDN/?{StandardTokens}&amp;TypeDisplay=FullScreen&amp;SPHostLogoUrl=Content/img/S2SLogo.png"
+    $AppManifest.App.Properties.StartPage = "https://$FQDN/Web/?{StandardTokens}&amp;TypeDisplay=FullScreen&amp;SPHostLogoUrl=Content/img/S2SLogo.png"
     $AppManifest.App.AppPrincipal.RemoteWebApplication.ClientId = $clientID.ToString()
     $AppManifest.Save("$PhysicalBasePath\App\AppManifest.xml")
 
-    $AppElements.Elements.ClientWebPart.Content.Src = "https://$FQDN/MeetingManagerAppPart?{StandardTokens}"
+    $AppElements.Elements.ClientWebPart.Content.Src = "https://$FQDN/Web/MeetingManagerAppPart?{StandardTokens}"
     #Now save it under its original name determined by Get-Content before
     $AppElements.Save($ElementsXML.FullName)
 
     Write-Verbose 'Create ZIP'
     #BUG ZIP function is not good and App Catalog cannot extract it
-    Zip "$PhysicalBasePath\App" "$PhysicalBasePath\$AppFilename.zip"
+        #Zip "$PhysicalBasePath\App" "$PhysicalBasePath\$AppFilename.zip"
+    #FIX: New ZIP Algorithm which should SharePoint able to read.
+    New-ZipFile -InputObject ($ElementsXML.FullName) -ZipFilePath "$PhysicalBasePath\$appName.zip" -Append -Force
+    New-ZipFile -InputObject ("$PhysicalBasePath\App\AppManifest.xml") -ZipFilePath "$PhysicalBasePath\$appName.zip" -Append -Force
+    
     Write-Verbose 'Rename .ZIP to .app'
-    Rename-Item -Path ("$PhysicalBasePath\$AppFilename.zip") -NewName "$appName.app"
+    Rename-Item -Path ("$PhysicalBasePath\$appName.zip") -NewName "$appName.app"
 
     Write-Output 'Determine App Catalog'
     Write-Verbose "SPWeb:($($SPWeb.split('/')[0])//$($SPWeb.split('/')[2])"
