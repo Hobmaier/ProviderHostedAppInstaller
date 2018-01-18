@@ -48,3 +48,6 @@ Please customize the XML file which includes
 # Run Installation
 Use PowerShell with admin priviliges. Make sure that you've customized the XML in the previous step
 PS D:\ProviderHostedAppInstaller\ .\Install-ProviderHostedApp.ps1 -InputFile "D:\ProviderHostedAppInstaller\Install-ProviderHostedApp-Config.xml"
+
+# More
+Please also see this: https://www.hobmaier.net/2018/01/sharepoint-provider-hosted-app-installer.html
