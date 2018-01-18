@@ -681,12 +681,32 @@ Register-SPAppPrincipal -DisplayName $appName -NameIdentifier $appIdentifier -Si
 #Server-to-Server (S2S) Trust
 #If creating the Certificate just through New-SelfSignedCertificate directly, it won't work. Therefore I've created
 #a Self-Signed Certificate in IIS Manager UI, exported it and clone it now, hope it works.
-$certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2((Join-Path -Path $PSScriptRoot -ChildPath 'ProviderHostedApp.pfx'),"Solutions2Share")
-$SelfSignedCert = New-SelfSignedCertificate -CloneCert $certificate -DnsName $appInternalName -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop
+#$certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2((Join-Path -Path $PSScriptRoot -ChildPath 'ProviderHostedApp.pfx'),"Solutions2Share")
+#$SelfSignedCert = New-SelfSignedCertificate -CloneCert $certificate -DnsName $appInternalName -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop
+
+Write-Output 'Create Self-Signed Certificate'
+
+# Different Way
+# Source: https://gallery.technet.microsoft.com/scriptcenter/Self-signed-certificate-5920a7c6
+# From: 9/11/2016 
+. "$PSScriptRoot\New-SelfSignedCertificateEx.ps1"
+$SelfSignedCert = New-SelfsignedCertificateEx -Subject "CN=$($appInternalName)" `
+-EnhancedKeyUsage "Server Authentication" `
+-KeyUsage "KeyEncipherment,DataEncipherment" `
+-StoreLocation "LocalMachine" `
+-Exportable `
+-SignatureAlgorithm SHA1 `
+-NotAfter $([datetime]::now.AddYears(5))`
+-FriendlyName "$($appInternalName)"
+
 #Export to prepare S2S Trust
 # Wait, sometimes it's not ready immediately
 Start-Sleep -Seconds 2
 Export-Certificate -Cert Cert:\LocalMachine\my\$($SelfSignedCert.Thumbprint) -FilePath (Join-Path -Path $PhysicalBasePath -ChildPath 'Installer.cer') -ErrorAction Stop | Out-Null
+Start-Sleep -Milliseconds 20
+#Import into local Trusted Root CA
+Import-Certificate -FilePath (Join-Path -Path $PhysicalBasePath -ChildPath 'Installer.cer') -CertStoreLocation Cert:\LocalMachine\Root
+Start-Sleep -Milliseconds 20
 
 Write-Host 'Create Server to Server Trust'
 try {
