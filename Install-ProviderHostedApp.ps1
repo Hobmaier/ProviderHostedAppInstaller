@@ -11,7 +11,6 @@
         Solutions2Share.Solutions.MeetingManagerWeb.zip
         Install-ProviderHostedApp-Config.xml
         Install-ProviderHostedApp.ps1
-        ProviderHostedApp.pfx
         WebDeploy_2_10_amd64_en-US.msi
 .Example
     .\Install-ProviderHostedApp.ps1 -InputFile "D:\ProviderHostedAppInstaller\Install-ProviderHostedApp-Config.xml"

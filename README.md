@@ -24,7 +24,6 @@ Solutions2Share.Solutions.MeetingManagerWeb.zip
 Just add this PowerShell to the same directory:
 Install-ProviderHostedApp-Config.xml
 Install-ProviderHostedApp.ps1
-ProviderHostedApp.pfx
 WebDeploy_2_10_amd64_en-US.msi
 
 # Customize XML
